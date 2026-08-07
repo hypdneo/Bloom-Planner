@@ -452,7 +452,7 @@
 
   <div class="board" id="board"></div>
 
-  <footer>made with 🌸 in bloom — click a task to check it off, click again to remove</footer>
+  <footer id="footerText">made with 🌸 in bloom — click a task to check it off, click again to remove</footer>
 </div>
 
 <script>
@@ -861,6 +861,33 @@ if(notifsEnabled){
 }
 
 render();
+
+// --- Lightweight personalization ---
+// If the link included ?for=Name (e.g. from a purchase delivery),
+// remember it permanently on this device and show it quietly in the footer.
+// This is just a soft deterrent against public sharing, not real DRM —
+// most small digital products don't need more than this.
+(function personalize(){
+  const LICENSE_KEY = 'bloom_licensed_to';
+  const params = new URLSearchParams(window.location.search);
+  const fromUrl = params.get('for');
+
+  if(fromUrl && fromUrl.trim()){
+    localStorage.setItem(LICENSE_KEY, fromUrl.trim().slice(0, 40));
+    // Clean the name out of the visible URL so it doesn't look odd if they bookmark/share it later,
+    // while keeping it saved on this device already.
+    const cleanUrl = window.location.pathname + window.location.hash;
+    window.history.replaceState({}, '', cleanUrl);
+  }
+
+  const licensedTo = localStorage.getItem(LICENSE_KEY);
+  if(licensedTo){
+    const footer = document.getElementById('footerText');
+    if(footer){
+      footer.textContent = `made with 🌸 in bloom — for ${licensedTo} 🌱`;
+    }
+  }
+})();
 
 // Register service worker for full PWA support (offline caching, installability)
 if('serviceWorker' in navigator){
