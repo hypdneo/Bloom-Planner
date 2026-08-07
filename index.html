@@ -668,6 +668,99 @@ document.getElementById('nextWeek').addEventListener('click', ()=>{ weekOffset++
    that would need a paid push service. */
 
 const hasNotifAPI = ('Notification' in window);
+const hasPushAPI = ('serviceWorker' in navigator && 'PushManager' in window);
+
+// --- Piece 4 will give us a real backend URL. Leave blank until then — ---
+// --- every push-related call below safely no-ops if this is empty.    ---
+const PUSH_API_BASE = ''; // e.g. 'https://bloom-push.yourname.workers.dev'
+
+const VAPID_PUBLIC_KEY = 'BLnsOvT2lLe4ws8zLEvGidEhLKB8hTkIxxKJs31u-dZqKXCHuQ3SM4Tuk6QBk-UdlRik2WuaNBpa5RUyK5h7X78';
+
+function urlBase64ToUint8Array(base64String){
+  const padding = '='.repeat((4 - base64String.length % 4) % 4);
+  const base64 = (base64String + padding).replace(/-/g, '+').replace(/_/g, '/');
+  const rawData = atob(base64);
+  return Uint8Array.from([...rawData].map(c => c.charCodeAt(0)));
+}
+
+let pushSubscription = null;
+
+async function subscribeToPush(){
+  if(!hasPushAPI) return null;
+  try{
+    const reg = await navigator.serviceWorker.ready;
+    let sub = await reg.pushManager.getSubscription();
+    if(!sub){
+      sub = await reg.pushManager.subscribe({
+        userVisibleOnly: true,
+        applicationServerKey: urlBase64ToUint8Array(VAPID_PUBLIC_KEY)
+      });
+    }
+    pushSubscription = sub;
+    if(PUSH_API_BASE){
+      await fetch(`${PUSH_API_BASE}/subscribe`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ subscription: sub })
+      }).catch(()=>{ /* offline or backend not ready — fine, local reminders still work */ });
+    }
+    return sub;
+  } catch(e){
+    console.error('Push subscribe failed', e);
+    return null;
+  }
+}
+
+async function unsubscribeFromPush(){
+  if(!hasPushAPI) return;
+  try{
+    const reg = await navigator.serviceWorker.ready;
+    const sub = await reg.pushManager.getSubscription();
+    if(sub){
+      if(PUSH_API_BASE){
+        await fetch(`${PUSH_API_BASE}/unsubscribe`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ endpoint: sub.endpoint })
+        }).catch(()=>{});
+      }
+      await sub.unsubscribe();
+    }
+    pushSubscription = null;
+  } catch(e){ /* ignore */ }
+}
+
+// Tell the backend to actually deliver a push at the task's due time,
+// so it fires even if bloom is fully closed. Safely no-ops until PUSH_API_BASE is set.
+async function syncReminderToServer(key, task){
+  if(!PUSH_API_BASE || !pushSubscription || !task.time) return;
+  const [h, m] = task.time.split(':').map(Number);
+  const due = new Date(key + 'T00:00:00');
+  due.setHours(h, m, 0, 0);
+  if(due.getTime() <= Date.now()) return;
+
+  fetch(`${PUSH_API_BASE}/schedule-reminder`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      endpoint: pushSubscription.endpoint,
+      subscription: pushSubscription,
+      taskId: String(task.id),
+      title: 'bloom. 🌱',
+      body: task.text,
+      dueAt: due.toISOString()
+    })
+  }).catch(()=>{ /* backend not reachable — local/in-app reminder still covers it while open */ });
+}
+
+function cancelReminderOnServer(taskId){
+  if(!PUSH_API_BASE) return;
+  fetch(`${PUSH_API_BASE}/cancel-reminder`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ taskId: String(taskId) })
+  }).catch(()=>{});
+}
 
 function showToast(title, body){
   const el = document.createElement('div');
@@ -695,6 +788,9 @@ function updateNotifButton(){
 function scheduleReminder(key, task){
   if(!notifsEnabled || !task.time) return;
 
+  // Ask the backend to deliver this even if bloom gets fully closed (once piece 4 is live)
+  syncReminderToServer(key, task);
+
   const [h, m] = task.time.split(':').map(Number);
   const target = new Date(key + 'T00:00:00');
   target.setHours(h, m, 0, 0);
@@ -704,9 +800,9 @@ function scheduleReminder(key, task){
   if(delay <= 0 || delay > 20*24*60*60*1000) return;
 
   const timerId = setTimeout(()=>{
-    // Always show an in-app reminder — works on every platform, including iPad
+    // Always show an in-app reminder — works on every platform, including iPad, while bloom is open
     showToast('⏰ reminder', task.text);
-    // Bonus: also fire a real OS notification where the browser supports it
+    // Bonus: also fire a real OS notification directly where the browser supports it
     if(hasNotifAPI && Notification.permission === 'granted'){
       try{ new Notification('bloom. 🌱', { body: task.text, tag: String(task.id) }); }
       catch(e){ /* ignore */ }
@@ -722,6 +818,7 @@ function clearReminder(taskId){
     clearTimeout(scheduledTimers[taskId]);
     delete scheduledTimers[taskId];
   }
+  cancelReminderOnServer(taskId);
 }
 
 function rescheduleAllReminders(){
@@ -740,19 +837,27 @@ document.getElementById('notifToggle').addEventListener('click', async ()=>{
     if(hasNotifAPI){
       try{ await Notification.requestPermission(); } catch(e){ /* ignore */ }
     }
+    if(hasPushAPI){
+      await subscribeToPush();
+    }
     rescheduleAllReminders();
-    showToast('🔔 reminders on', hasNotifAPI ? "you'll get notified when tasks are due" : "you'll see a banner here when tasks are due, while bloom is open");
+    const msg = PUSH_API_BASE
+      ? "you'll get notified even if bloom is closed"
+      : (hasNotifAPI ? "you'll get notified when tasks are due, while bloom is open" : "you'll see a banner here when tasks are due, while bloom is open");
+    showToast('🔔 reminders on', msg);
   } else {
     notifsEnabled = false;
     localStorage.setItem(NOTIF_KEY, 'false');
     rescheduleAllReminders(); // clears all since notifsEnabled is now false
+    await unsubscribeFromPush();
   }
   updateNotifButton();
 });
 
 updateNotifButton();
 if(notifsEnabled){
-  rescheduleAllReminders();
+  if(hasPushAPI){ subscribeToPush().then(rescheduleAllReminders); }
+  else { rescheduleAllReminders(); }
 }
 
 render();
